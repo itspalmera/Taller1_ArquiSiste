@@ -1,5 +1,10 @@
+using System.IO.Compression;
+using System.Text.Json;
 using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.ResponseCompression;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.Extensions.Options;
 using Microsoft.OpenApi;
 using Scalar.AspNetCore;
@@ -10,22 +15,20 @@ using Shortly.Endpoints;
 using Shortly.Infrastructure;
 using Shortly.Infrastructure.Persistence;
 using Shortly.Infrastructure.Repositories;
+using Shortly.Middlewares;
 
-// Creates the ASP.NET Core application builder with initial configuration
 var builder = WebApplication.CreateBuilder(args);
 
-// Configures Serilog as the global bootstrap logger, reading all settings from appsettings.json
+// Configuración de Serilog
 Log.Logger = new LoggerConfiguration()
     .ReadFrom.Configuration(builder.Configuration)
     .CreateLogger();
 
-// Tells the host to use Serilog as its logging system
 builder.Host.UseSerilog();
 
-// Registers Razor Pages services
 builder.Services.AddRazorPages();
 
-// Registers the OpenAPI document generator with version 3.1 and API metadata
+// OpenAPI
 builder.Services.AddOpenApi(options =>
 {
     options.OpenApiVersion = OpenApiSpecVersion.OpenApi3_1;
@@ -34,30 +37,40 @@ builder.Services.AddOpenApi(options =>
         document.Info = new()
         {
             Title = "Shortly API",
-            Description = "A URL shortener service with user authentication and link management.",
+            Description = "A URL shortener service with HTTP protocol optimizations.",
             Version = "v1"
         };
         return Task.CompletedTask;
     });
 });
 
-// Registers the SQLite database context using Entity Framework Core
+// DbContext
 builder.Services.AddDbContext<AppDbContext>(options =>
     options.UseSqlite(builder.Configuration.GetConnectionString("AppDbContext")));
 
-// Configures a volatile server-side ticket store (auth state lost on restart)
 builder.Services.AddDistributedMemoryCache();
 builder.Services.AddSingleton<MemoryCacheTicketStore>();
 
-// Configures cookie authentication with a server-side ticket store
+// =========================================================================
+// ITEM 9: Cookie Hardening Audit
+// Concepto HTTP/Seguridad:
+// - HttpOnly: Bloquea el acceso a la cookie desde scripts JS (mitiga XSS).
+// - SameSite=Strict: Evita el envío de la cookie en peticiones cross-site (mitiga CSRF).
+// - Secure: Fuerza la transmisión únicamente sobre canales HTTPS cifrados.
+// =========================================================================
 builder.Services.AddAuthentication(CookieAuthenticationDefaults.AuthenticationScheme)
     .AddCookie(options =>
     {
         options.LoginPath = "/Login";
         options.AccessDeniedPath = "/Error";
+        options.Cookie.Name = "__Host-ShortlySession";
+        options.Cookie.HttpOnly = true;
+        options.Cookie.SameSite = SameSiteMode.Strict;
+        options.Cookie.Path = "/";
+        options.Cookie.SecurePolicy = CookieSecurePolicy.Always;
+        options.ExpireTimeSpan = TimeSpan.FromHours(2);
     });
 
-// Injects the ticket store into the cookie options after the service provider is built
 builder.Services.AddSingleton<IConfigureOptions<CookieAuthenticationOptions>>(sp =>
 {
     var store = sp.GetRequiredService<MemoryCacheTicketStore>();
@@ -66,66 +79,138 @@ builder.Services.AddSingleton<IConfigureOptions<CookieAuthenticationOptions>>(sp
         options => options.SessionStore = store);
 });
 
-// Registers the authorization service
+// =========================================================================
+// ITEM 5: Rate Limiting
+// Concepto HTTP: Previene ataques de fuerza bruta respondiendo '429 Too Many Requests'
+// e incluyendo el encabezado 'Retry-After'.
+// =========================================================================
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.OnRejected = async (context, token) =>
+    {
+        context.HttpContext.Response.Headers.RetryAfter = "60";
+        await context.HttpContext.Response.WriteAsync("Too many attempts. Please try again in 60 seconds.", token);
+    };
+    options.AddFixedWindowLimiter("login-policy", opt =>
+    {
+        opt.PermitLimit = 5; // 5 intentos
+        opt.Window = TimeSpan.FromMinutes(1); // por minuto
+        opt.QueueLimit = 0;
+    });
+});
+
+// =========================================================================
+// ITEM 6: Response Compression (Brotli + Gzip)
+// Concepto HTTP: Reduce el tamaño de transferencia mediante algoritmos de compresión.
+// Brotli ofrece mayor tasa de compresión para texto que Gzip.
+// =========================================================================
+builder.Services.AddResponseCompression(options =>
+{
+    options.EnableForHttps = true;
+    options.Providers.Add<BrotliCompressionProvider>();
+    options.Providers.Add<GzipCompressionProvider>();
+    options.MimeTypes = ResponseCompressionDefaults.MimeTypes.Concat(
+        new[] { "application/problem+json", "image/svg+xml" });
+});
+
+builder.Services.Configure<BrotliCompressionProviderOptions>(options =>
+{
+    options.Level = CompressionLevel.Fastest;
+});
+
+// =========================================================================
+// ITEM 7: Restrictive CORS Policy
+// Concepto HTTP: Controla qué orígenes externos pueden realizar solicitudes cross-origin,
+// gestionando peticiones preflight (OPTIONS).
+// =========================================================================
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("RestrictiveCorsPolicy", policy =>
+    {
+        policy.WithOrigins("https://shortly.disc.cl")
+              .WithMethods("GET", "POST")
+              .WithHeaders("Content-Type", "Accept", "Authorization")
+              .SetPreflightMaxAge(TimeSpan.FromHours(1));
+    });
+});
+
+// =========================================================================
+// ITEM 14: Health Checks [BONUS]
+// =========================================================================
+builder.Services.AddHealthChecks()
+    .AddDbContextCheck<AppDbContext>("database_health_check");
+
 builder.Services.AddAuthorization();
 
-// Registers repositories and services for dependency injection (scoped lifetime)
 builder.Services.AddScoped<IUserRepository, UserRepository>();
 builder.Services.AddScoped<ILinkRepository, LinkRepository>();
 builder.Services.AddScoped<IUserService, UserService>();
 builder.Services.AddScoped<ILinkService, LinkService>();
 
-// Builds the application with all registered configurations
 var app = builder.Build();
 
-// In non-development environments, uses a friendly error page
 if (!app.Environment.IsDevelopment())
 {
     app.UseExceptionHandler("/Error");
+    app.UseHsts();
 }
 
-// Redirects HTTP requests to HTTPS automatically
-// app.UseHttpsRedirection();
+// Pipeline de Middlewares en Orden de Ejecución Correcto
+app.UseMiddleware<RequestTracingMiddleware>();    // Item #12: Tracing
+app.UseMiddleware<PerformanceMiddleware>();       // Item #4: Latencia
+app.UseMiddleware<SecurityHeadersMiddleware>();   // Item #3: Security Headers
 
-// Serves static files from the wwwroot/ folder
+app.UseResponseCompression();                      // Item #6: Compresión
 app.UseStaticFiles();
 
-// Enables request routing
 app.UseRouting();
 
-// Enables authentication (must come after UseRouting)
-app.UseAuthentication();
+app.UseCors("RestrictiveCorsPolicy");             // Item #7: CORS
+app.UseRateLimiter();                             // Item #5: Rate Limiting
 
-// Enables authorization (must come after UseAuthentication)
+app.UseAuthentication();
 app.UseAuthorization();
 
-// Maps static assets with automatic versioning
 app.MapStaticAssets();
-
-// Maps Razor Pages with static asset support
 app.MapRazorPages().WithStaticAssets();
-
-// Exposes the OpenAPI document at /openapi/v1.json
 app.MapOpenApi();
-
-// Serves the Scalar interactive API reference UI at /scalar/v1
 app.MapScalarApiReference();
 
-// Maps the redirect endpoint GET /{shortUrl} from Endpoints/UrlRedirectEndpoint.cs
 app.MapUrlRedirect();
 
-// Creates a scope for scoped services (e.g. AppDbContext)
+// =========================================================================
+// ITEM 14: Health Check Endpoint [BONUS]
+// =========================================================================
+app.MapHealthChecks("/health", new()
+{
+    ResponseWriter = async (context, report) =>
+    {
+        context.Response.ContentType = "application/json";
+        var result = JsonSerializer.Serialize(new
+        {
+            status = report.Status.ToString(),
+            uptime = Environment.TickCount64,
+            checks = report.Entries.Select(e => new { key = e.Key, status = e.Value.Status.ToString() })
+        });
+        await context.Response.WriteAsync(result);
+    }
+});
+
+// =========================================================================
+// ITEM 15: Crawler Control Endpoints (robots.txt & sitemap.xml) [BONUS]
+// Concepto HTTP: Instruit a web crawlers y bots no indexar las URLs acortadas.
+// =========================================================================
+app.MapGet("/robots.txt", () => Results.Text("User-agent: *\nDisallow: /", "text/plain"));
+app.MapGet("/sitemap.xml", () => Results.Text("<?xml version=\"1.0\" encoding=\"UTF-8\"?><urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\"></urlset>", "application/xml"));
+
+// Inicialización de la BD
 using (var scope = app.Services.CreateScope())
 {
-    // Gets the database context from the DI container
     var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
-    // Creates the database and tables if they do not exist
     db.Database.EnsureCreated();
-    // Reads the admin password from configuration or uses a default value
     var seedPassword = app.Configuration["Seed:AdminPassword"] ?? "admin123";
-    // Seeds initial data (admin user and sample links)
     await DbInitializer.InitializeAsync(db, seedPassword);
 }
 
-// Starts the application and begins listening for HTTP requests
 await app.RunAsync();
